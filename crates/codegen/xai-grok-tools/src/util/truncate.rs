@@ -139,15 +139,21 @@ pub fn truncate_with_preview(
     footer_hint: Option<&str>,
 ) -> (String, bool) {
     let PartialOutput { text, total_bytes } = output;
-    if text.len() <= max_bytes {
+    let whole = total_bytes <= text.len();
+    if whole && text.len() <= max_bytes {
         return (text.to_string(), false);
     }
 
-    let preview = truncate_str(text, preview_bytes.min(text.len()));
     let footer = match footer_hint {
         Some(hint) => format!("[Output truncated - {total_bytes} bytes total. {hint}]"),
         None => format!("[Output truncated - {total_bytes} bytes total]"),
     };
+    // Text that fits the limit can still be part of a larger output; the
+    // reader still needs the total size and where to find the rest.
+    if text.len() <= max_bytes {
+        return (format!("{text}\n\n{footer}"), true);
+    }
+    let preview = truncate_str(text, preview_bytes.min(text.len()));
     (format!("{preview}\n\n{footer}"), true)
 }
 
@@ -233,14 +239,21 @@ pub fn estimate_chars(s: u64) -> u64 {
     xai_token_estimation::estimate_chars(s)
 }
 
-pub fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1_000_000 {
-        format!("{:.1}MB", bytes as f64 / 1_000_000.0)
-    } else if bytes >= 1_000 {
-        format!("{:.1}KB", bytes as f64 / 1_000.0)
-    } else {
-        format!("{}B", bytes)
+/// Human-readable size in powers of 1024: integral bytes (`512 B`), one
+/// decimal above (`1.5 MB`). Every output fits nine columns.
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
     }
+    const UNITS: &[&str] = &["KB", "MB", "GB", "TB", "PB"];
+    let mut val = bytes as f64 / 1024.0;
+    for unit in UNITS {
+        if val < 1023.95 {
+            return format!("{val:.1} {unit}");
+        }
+        val /= 1024.0;
+    }
+    format!("{val:.1} EB")
 }
 
 /// Apply soft-wrapping to every line in a multi-line string.
@@ -374,6 +387,22 @@ pub fn truncate_lines_to_char_budget(content: &str, budget: usize) -> (String, b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_bytes_scales_units() {
+        let cases = [
+            (0, "0 B"),
+            (512, "512 B"),
+            (1024, "1.0 KB"),
+            (1536, "1.5 KB"),
+            (1_048_575, "1.0 MB"),
+            (1 << 50, "1.0 PB"),
+            (u64::MAX, "16.0 EB"),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(format_bytes(bytes), expected, "bytes = {bytes}");
+        }
+    }
 
     // ---- estimate_tokens ----
 
@@ -586,13 +615,29 @@ mod tests {
         assert!(result.contains("Use read_file for full content"));
     }
 
-    /// A caller holding part of a larger output states the real size.
+    /// A partial copy always states the size of the output it came from,
+    /// whether or not the text on hand needed cutting.
     #[test]
-    fn truncate_with_preview_reports_the_size_it_is_given() {
+    fn a_partial_copy_always_states_the_real_size() {
+        // The text fits the limit: kept whole, footer added.
+        let (result, truncated) = truncate_with_preview(
+            PartialOutput::part_of("held", 5_000_000),
+            4_000,
+            2_000,
+            Some("Use read_file for full content"),
+        );
+        assert!(truncated);
+        assert!(result.starts_with("held"), "{result}");
+        assert!(result.contains("5000000 bytes total"), "{result}");
+        assert!(
+            result.contains("Use read_file for full content"),
+            "{result}"
+        );
+
+        // The text is over the limit: cut, and the footer keeps the total.
         let held = "x".repeat(10_000);
         let (result, truncated) =
             truncate_with_preview(PartialOutput::part_of(&held, 5_000_000), 4_000, 2_000, None);
-
         assert!(truncated);
         assert!(result.contains("5000000 bytes total"), "{result}");
     }
